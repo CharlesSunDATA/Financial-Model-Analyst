@@ -5,17 +5,17 @@
 ## 一次性執行
 
 ```bash
-cd nq100_month_drawdown
+cd main_code
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python main.py
+python nq100_month_drawdown.py
 ```
 
 離線（只讀既有日線）：
 
 ```bash
-python main.py --local-only
+python nq100_month_drawdown.py --local-only
 ```
 
 ## 每日自動更新（macOS / Linux：`cron`）
@@ -30,10 +30,10 @@ crontab -e
 例如每個**美股交易日約收盤後**（此例為 UTC 21:30，請依你時區調整）：
 
 ```
-30 21 * * 1-5 /Users/charles/Desktop/Python/nq100_month_drawdown/run_daily.sh
+30 21 * * 1-5 /Users/charles/Desktop/Python/main_code/run_daily.sh
 ```
 
-日誌寫在 `nq100_month_drawdown/logs/daily.log`。
+日誌寫在 `main_code/logs/daily.log`。
 
 ## 常用參數
 

@@ -9,4 +9,4 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 exec >>"$LOG_DIR/daily.log" 2>&1
 echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') ====="
-exec .venv/bin/python main.py
+exec .venv/bin/python nq100_month_drawdown.py
