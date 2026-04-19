@@ -1,0 +1,19 @@
+# API keys — do not commit
+credentials.json
+**/credentials.json
+
+# Local data (regenerate with scripts)
+database/*.csv
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyc
+
+# OS
+.DS_Store
+
+# Training folder: may contain service account JSONs
+Python_training/Json/
