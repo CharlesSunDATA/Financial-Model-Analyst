@@ -1,0 +1,1 @@
+-r Stock_Financial_model/requirements.txt
