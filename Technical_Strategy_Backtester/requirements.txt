@@ -1,0 +1,10 @@
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2.40
+streamlit>=1.32.0
+plotly>=5.18.0
+# pandas_ta currently pulls in numba which doesn't support Python 3.14.
+pandas_ta>=0.3.14b0; python_version < "3.14"
+ta>=0.11.0; python_version >= "3.14"
+watchdog>=4.0.0
+

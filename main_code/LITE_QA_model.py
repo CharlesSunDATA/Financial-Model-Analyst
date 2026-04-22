@@ -1,10 +1,7 @@
 """
-LITE (Lumentum) 季報財務資料：以 yfinance 抓取、輸出 CSV、上傳 Google Sheets。
-執行目錄不限；credentials 預設為專案根目錄的 credentials.json。
+LITE (Lumentum) 季報財務資料：以 yfinance 抓取、輸出 CSV、寫入 MySQL。
 
-目標試算表（QA_01_FM）：
-https://docs.google.com/spreadsheets/d/1AkHVsRUHlMnjs1Ean4YfyvySfWVCIDdsq2_ZMI1b3UE/edit
-請將該檔案與 service account 電子郵件共用（編輯者），API 才能寫入。
+MySQL 連線請設定環境變數：MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
 """
 
 from __future__ import annotations
@@ -12,21 +9,25 @@ from __future__ import annotations
 import warnings
 from pathlib import Path
 
-import gspread
 import pandas as pd
 import yfinance as yf
+
+from lite_mysql import upsert_statements
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 TICKER = "LITE"
-# 共享試算表 ID（網址 .../d/<這段>/edit...）
-SPREADSHEET_ID = "1AkHVsRUHlMnjs1Ean4YfyvySfWVCIDdsq2_ZMI1b3UE"
-CREDENTIALS_PATH = Path(__file__).resolve().parent.parent / "credentials.json"
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "database"
 CSV_INCOME = OUTPUT_DIR / "LITE_quarterly_income.csv"
 CSV_BALANCE = OUTPUT_DIR / "LITE_quarterly_balance.csv"
 CSV_CASHFLOW = OUTPUT_DIR / "LITE_quarterly_cashflow.csv"
+
+STMT_TYPE_MAP = {
+    "季損益 (Quarterly Income)": "income",
+    "資產負債 (Quarterly Balance)": "balance",
+    "現金流量 (Quarterly Cashflow)": "cashflow",
+}
 
 
 def _statement_to_df(raw) -> pd.DataFrame:
@@ -64,47 +65,13 @@ def save_csvs(statements: dict[str, pd.DataFrame]) -> dict[str, Path]:
     return paths
 
 
-def _df_to_sheet_rows(df: pd.DataFrame) -> list[list]:
-    if df.empty:
-        return [["No data"]]
-    out = df.reset_index().rename(columns={"index": "Line_Item"})
-    out = out.fillna("")
-    header = [str(c) for c in out.columns.tolist()]
-    rows = out.values.tolist()
-    return [header] + rows
-
-
-def upload_google_sheets(statements: dict[str, pd.DataFrame]) -> None:
-    if not CREDENTIALS_PATH.is_file():
-        print(f"上傳略過: 找不到 credentials 檔案 {CREDENTIALS_PATH}")
-        return
+def upload_mysql(statements: dict[str, pd.DataFrame]) -> None:
     try:
-        gc = gspread.service_account(filename=str(CREDENTIALS_PATH))
-        sh = gc.open_by_key(SPREADSHEET_ID)
+        n = upsert_statements(TICKER, statements, STMT_TYPE_MAP)
+        print(f"MySQL 已寫入 / 更新 {n} 筆季報列。")
     except Exception as e:
-        print(f"連線 Google Sheets 失敗: {e}")
-        print("（請確認試算表已與 credentials 內 service account 信箱共用為編輯者）")
-        return
-
-    sheet_slug = {
-        "季損益 (Quarterly Income)": "LITE_QA_Income",
-        "資產負債 (Quarterly Balance)": "LITE_QA_Balance",
-        "現金流量 (Quarterly Cashflow)": "LITE_QA_Cashflow",
-    }
-
-    for name, df in statements.items():
-        title = sheet_slug[name]
-        try:
-            ws = sh.worksheet(title)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=title, rows=300, cols=30)
-        try:
-            ws.clear()
-            data = _df_to_sheet_rows(df)
-            ws.update(data, value_input_option="USER_ENTERED")
-            print(f"已上傳工作表: {title}")
-        except Exception as e:
-            print(f"上傳工作表 {title} 失敗: {e}")
+        print(f"MySQL 寫入失敗: {e}")
+        print("（請確認 MySQL 已啟動且環境變數 MYSQL_* 正確、已授權該使用者建表與寫入）")
 
 
 def main() -> None:
@@ -112,7 +79,7 @@ def main() -> None:
     print(f"抓取 {TICKER} 季報財務資料 (yfinance)...")
     statements = fetch_lite_quarterly()
     save_csvs(statements)
-    upload_google_sheets(statements)
+    upload_mysql(statements)
     print("完成。")
 
 

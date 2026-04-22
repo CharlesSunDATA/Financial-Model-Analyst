@@ -43,3 +43,9 @@ crontab -e
 | `--yf-period 3mo` | yfinance 下載區間（須夠長以涵蓋 `--days`） |
 | `--no-save-prices` | 只更新排行、不覆寫日線 CSV |
 | `--prices` / `--rank-out` | 自訂日線與排行輸出路徑 |
+
+## LITE：MySQL + 營收趨勢（Streamlit）
+
+1. 建立資料庫（例：`CREATE DATABASE financial_qa;`），並設定環境變數：`MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE`。
+2. 匯入季報至 MySQL：`python LITE_QA_model.py`（仍會寫入 `database/LITE_quarterly_*.csv`）。
+3. 啟動儀表板：`streamlit run lite_revenue_streamlit.py`（顯示最近**四季** Total Revenue 趨勢；公開財報無週營收）。

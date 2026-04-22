@@ -14,12 +14,49 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from scipy.optimize import minimize
+from scipy.optimize import Bounds, LinearConstraint, minimize
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 TRADING_DAYS = 252
 N_MONTE_CARLO = 10_000
+
+# Diversification: avoid corner solutions (100% in one asset). Long-only, per-asset cap.
+WEIGHT_MIN = 0.05
+WEIGHT_MAX = 0.2  # 20% max per name → need at least ceil(1/0.2) = 5 names to sum to 100%
+MIN_ASSETS_FOR_WEIGHT_CAP = 5
+MAX_ASSETS_FOR_WEIGHT_FLOOR = 20  # floor 5% → at most floor(1/0.05)=20 names can fit
+# Shown in UI so you can confirm Streamlit Cloud deployed the capped-optimizer code.
+OPTIMIZER_BUILD_ID = "min5-max20-per-asset-bounds-2026-04"
+
+def _weight_bounds(n: int) -> tuple[tuple[float, float], ...]:
+    """Box constraints for scipy.optimize: each weight in [WEIGHT_MIN, WEIGHT_MAX]."""
+    return tuple((WEIGHT_MIN, WEIGHT_MAX) for _ in range(n))
+
+
+def _feasible_weight_cap(n: int) -> bool:
+    """Feasible iff we can satisfy sum(w)=1 with WEIGHT_MIN ≤ w_i ≤ WEIGHT_MAX."""
+    return (
+        n >= MIN_ASSETS_FOR_WEIGHT_CAP
+        and n <= MAX_ASSETS_FOR_WEIGHT_FLOOR
+        and n * WEIGHT_MAX >= 1.0 - 1e-12
+        and n * WEIGHT_MIN <= 1.0 + 1e-12
+    )
+
+
+def _budget_constraint(n: int) -> LinearConstraint:
+    """Linear equality: 1'w = 1."""
+    return LinearConstraint(np.ones((1, n)), 1.0, 1.0)
+
+
+def _feasible_start(n: int) -> np.ndarray:
+    w = np.full(n, WEIGHT_MIN, dtype=float)
+    remaining = 1.0 - float(n) * WEIGHT_MIN
+    if remaining <= 0:
+        return np.full(n, 1.0 / n, dtype=float)
+    w += remaining / n
+    w = np.clip(w, WEIGHT_MIN, WEIGHT_MAX)
+    return w / w.sum()
 
 
 def _parse_tickers(raw: list[str]) -> list[str]:
@@ -93,49 +130,131 @@ def neg_sharpe(
     return -(portfolio_return(w, mu) - rf) / vol
 
 
+def _weights_feasible(w: np.ndarray) -> bool:
+    s = float(w.sum())
+    if abs(s - 1.0) > 5e-4:
+        return False
+    if float(w.max()) > WEIGHT_MAX + 1e-5 or float(w.min()) < WEIGHT_MIN - 1e-5:
+        return False
+    return True
+
+
 def optimize_max_sharpe(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
+    """
+    Maximize Sharpe ratio subject to ∑w=1 and WEIGHT_MIN ≤ w_i ≤ WEIGHT_MAX (default 0–20%).
+    Uses trust-constr + explicit Bounds (more reliable than tuple bounds on some SciPy builds).
+    """
     n = len(mu)
-    x0 = np.ones(n) / n
-    bounds = tuple((0.0, 1.0) for _ in range(n))
-    cons = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
+    x0 = _feasible_start(n)
+    bounds = Bounds(WEIGHT_MIN, WEIGHT_MAX, keep_feasible=True)
+    lc = _budget_constraint(n)
     res = minimize(
         neg_sharpe,
         x0,
         args=(mu, cov, rf),
-        method="SLSQP",
+        method="trust-constr",
         bounds=bounds,
-        constraints=cons,
-        options={"maxiter": 500, "ftol": 1e-9},
+        constraints=[lc],
+        options={"maxiter": 3000, "gtol": 1e-8},
     )
+    w = np.asarray(res.x, dtype=float)
     if not res.success:
-        st.warning(f"Max-Sharpe optimizer: {res.message}")
-    w = np.clip(res.x, 0.0, 1.0)
-    s = w.sum()
-    return w / s if s > 0 else x0
+        st.warning(f"Max-Sharpe (trust-constr): {res.message}")
+    if not _weights_feasible(w):
+        res2 = minimize(
+            neg_sharpe,
+            _feasible_start(n),
+            args=(mu, cov, rf),
+            method="SLSQP",
+            bounds=_weight_bounds(n),
+            constraints={"type": "eq", "fun": lambda ww: float(np.sum(ww)) - 1.0},
+            options={"maxiter": 3000, "ftol": 1e-11},
+        )
+        w = np.asarray(res2.x, dtype=float)
+        if not res2.success:
+            st.warning(f"Max-Sharpe (SLSQP fallback): {res2.message}")
+    w = np.clip(w, WEIGHT_MIN, WEIGHT_MAX)
+    return w
 
 
 def optimize_min_volatility(cov: np.ndarray) -> np.ndarray:
+    """
+    Minimize variance w'Σw subject to ∑w=1 and WEIGHT_MIN ≤ w_i ≤ WEIGHT_MAX (default 0–20%).
+    """
     n = cov.shape[0]
-    x0 = np.ones(n) / n
-    bounds = tuple((0.0, 1.0) for _ in range(n))
-    cons = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
+    x0 = _feasible_start(n)
+    bounds = Bounds(WEIGHT_MIN, WEIGHT_MAX, keep_feasible=True)
+    lc = _budget_constraint(n)
 
     def obj(w: np.ndarray) -> float:
-        return portfolio_volatility(w, cov) ** 2
+        return float(w @ cov @ w)
 
     res = minimize(
         obj,
         x0,
-        method="SLSQP",
+        method="trust-constr",
         bounds=bounds,
-        constraints=cons,
-        options={"maxiter": 500, "ftol": 1e-9},
+        constraints=[lc],
+        options={"maxiter": 3000, "gtol": 1e-8},
     )
+    w = np.asarray(res.x, dtype=float)
     if not res.success:
-        st.warning(f"Min-vol optimizer: {res.message}")
-    w = np.clip(res.x, 0.0, 1.0)
-    s = w.sum()
-    return w / s if s > 0 else x0
+        st.warning(f"Min-vol (trust-constr): {res.message}")
+    if not _weights_feasible(w):
+        cons = {"type": "eq", "fun": lambda ww: float(np.sum(ww)) - 1.0}
+        res2 = minimize(
+            obj,
+            _feasible_start(n),
+            method="SLSQP",
+            bounds=_weight_bounds(n),
+            constraints=cons,
+            options={"maxiter": 3000, "ftol": 1e-11},
+        )
+        w = np.asarray(res2.x, dtype=float)
+        if not res2.success:
+            st.warning(f"Min-vol (SLSQP fallback): {res2.message}")
+    w = np.clip(w, WEIGHT_MIN, WEIGHT_MAX)
+    return w
+
+
+def _sample_capped_simplex_weights(
+    n: int,
+    rng: np.random.Generator,
+    n_sims: int,
+) -> np.ndarray:
+    """
+    Random portfolios on {w : sum w = 1, WEIGHT_MIN <= w_i <= WEIGHT_MAX}.
+    Rejection sampling on Dirichlet(α); α is raised if acceptance is too low.
+    When 1 - n×WEIGHT_MIN = 0, the feasible set is a single point (all weights = WEIGHT_MIN).
+    """
+    if not _feasible_weight_cap(n):
+        raise ValueError("Infeasible weight bounds for this n.")
+    remaining_mass = 1.0 - float(n) * WEIGHT_MIN
+    if abs(remaining_mass) < 1e-12:
+        return np.tile(np.full(n, WEIGHT_MIN, dtype=float), (n_sims, 1))
+
+    u_cap = (WEIGHT_MAX - WEIGHT_MIN) / remaining_mass
+
+    out: list[np.ndarray] = []
+    alpha = max(12.0, float(n) * 2.0)
+    attempts = 0
+    max_attempts = max(500_000, n_sims * 500)
+    while len(out) < n_sims and attempts < max_attempts:
+        batch = min(65536, (n_sims - len(out)) * 4 + 1024)
+        W = rng.dirichlet(np.ones(n) * alpha, size=batch)
+        attempts += batch
+        for u in W:
+            if float(u.max()) <= u_cap + 1e-12:
+                w = WEIGHT_MIN + remaining_mass * np.asarray(u, dtype=np.float64)
+                out.append(w)
+                if len(out) >= n_sims:
+                    break
+        if len(out) < max(1, n_sims // 100) and attempts >= n_sims * 20:
+            alpha *= 1.35
+
+    while len(out) < n_sims:
+        out.append(_feasible_start(n))
+    return np.stack(out[:n_sims], axis=0)
 
 
 def monte_carlo_portfolios(
@@ -146,7 +265,7 @@ def monte_carlo_portfolios(
     rng: np.random.Generator,
 ) -> pd.DataFrame:
     n = len(mu)
-    W = rng.dirichlet(np.ones(n), size=n_sims)
+    W = _sample_capped_simplex_weights(n, rng, n_sims)
     rows: list[dict] = []
     for i in range(n_sims):
         w = W[i]
@@ -167,8 +286,10 @@ def monte_carlo_portfolios(
 def main() -> None:
     st.title("Markowitz efficient frontier & portfolio optimization")
     st.caption(
-        "Mean–variance optimization with Monte Carlo sampling and SciPy constrained solvers. "
-        "For education and research only — not investment advice."
+        f"**Build `{OPTIMIZER_BUILD_ID}`** — Mean–variance with Monte Carlo + SciPy **trust-constr** "
+        f"(explicit per-asset **Bounds**). Max-Sharpe and min-vol: **{WEIGHT_MIN:.0%}–{WEIGHT_MAX:.0%}** per name, "
+        f"all names get weight (no 0%). Requires **{MIN_ASSETS_FOR_WEIGHT_CAP}–{MAX_ASSETS_FOR_WEIGHT_FLOOR}** tickers with data. "
+        "Education/research only — not investment advice."
     )
 
     default_end = date.today()
@@ -225,6 +346,13 @@ def main() -> None:
             if len(cols) < 2:
                 st.error("Need at least two assets with data to build a covariance matrix.")
                 return
+            if not _feasible_weight_cap(len(cols)):
+                st.error(
+                    f"With per-asset bounds **{WEIGHT_MIN:.0%}–{WEIGHT_MAX:.0%}**, you need **{MIN_ASSETS_FOR_WEIGHT_CAP}–"
+                    f"{MAX_ASSETS_FOR_WEIGHT_FLOOR}** tickers with data so the portfolio can sum to 100%. "
+                    "Adjust the symbols in the sidebar."
+                )
+                return
             prices = prices[cols]
             daily_ret = prices.pct_change().dropna()
             mu_ann, cov_ann = ann_stats(daily_ret)
@@ -263,7 +391,7 @@ def main() -> None:
             "ann_return": "Annualized expected return (μ)",
             "sharpe_ratio": "Sharpe ratio",
         },
-        title=f"{N_MONTE_CARLO:,} random long-only portfolios (color = Sharpe)",
+        title=f"{N_MONTE_CARLO:,} random long-only portfolios, each weight ∈ [{WEIGHT_MIN:.0%}, {WEIGHT_MAX:.0%}] (color = Sharpe)",
         width=None,
         height=520,
     )
@@ -341,12 +469,12 @@ def main() -> None:
 
     with st.expander("Methodology"):
         st.markdown(
-            """
+            f"""
 - **Returns:** simple daily returns; annualized mean `× 252`, covariance `× 252`.
-- **Long-only:** weights ∈ [0,1], sum to 1.
-- **Max Sharpe:** maximize `(μ'w − rf) / √(w'Σw)` via `scipy.optimize.minimize` (SLSQP).
-- **Min variance:** minimize `w'Σw` under the same constraints.
-- **Monte Carlo:** Dirichlet samples → uniform random weights on the simplex.
+- **Long-only with bounds:** each `w_i ∈ [{WEIGHT_MIN}, {WEIGHT_MAX}]`, `∑w = 1`. This forces diversification: every name has at least **{WEIGHT_MIN:.0%}**, and no name exceeds **{WEIGHT_MAX:.0%}**.
+- **Max Sharpe:** maximize `(μ'w − rf) / √(w'Σw)` via `scipy.optimize.minimize` (**trust-constr** + `Bounds` + `LinearConstraint`; SLSQP as fallback).
+- **Min variance:** minimize `w'Σw` under the same bounds and budget constraint (same solvers).
+- **Monte Carlo:** Dirichlet rejection sampling on the **same** per-asset cap (matches SciPy feasible set; when `n × cap = 1` the cloud collapses to the unique equal-weight portfolio).
             """
         )
 
